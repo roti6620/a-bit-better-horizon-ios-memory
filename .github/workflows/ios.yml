@@ -16,10 +16,8 @@ concurrency:
 env:
   HORIZON_TELEMETRY_URL: "off"
   IOS_TARGET: aarch64-apple-ios
-  # `--release` with the `fast` profile's codegen: the release profile's single codegen unit and LTO cost minutes
-  # and the unsigned bundle is a test build.
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-  CARGO_PROFILE_RELEASE_LTO: "false"
+  # Full release codegen (the profile's own LTO and codegen units), like monZ05's build: a build without LTO
+  # and with 16 codegen units runs slower on the frame thread. It takes longer to build.
   CARGO_INCREMENTAL: "0"
   # The app's own minimum (project.yml); rustc and cc read it, and the Xcode step's Cargo phase sees the same.
   IPHONEOS_DEPLOYMENT_TARGET: "15.0"
@@ -29,7 +27,7 @@ jobs:
     # The native launcher uses the iOS 26 SDK (Liquid Glass). macos-15 defaults to Xcode 16.4.
     # MAC_RUNNER remains available for a maintainer-provided runner with Xcode 26 or newer.
     runs-on: ${{ github.event_name == 'pull_request' && 'macos-26' || vars.MAC_RUNNER || 'macos-26' }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash
@@ -128,3 +126,4 @@ jobs:
               echo "::warning::Discord delivery failed (HTTP $code). The IPA is available in this run's artifacts."
               ;;
           esac
+          
