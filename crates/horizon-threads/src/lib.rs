@@ -326,6 +326,10 @@ const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 /// quarter more memory than with the system heap; without it a few percent,
 /// and generation keeps most of its speed-up.
 pub fn configure_allocator() {
+    // iOS keeps mimalloc's own purge delay: with 0, every page a mesh or chunk job
+    // frees goes back to the kernel at once (madvise), and the next job faults it in
+    // again on the thread that is running the frame, which shows as random stutter.
+    #[cfg(not(target_os = "ios"))]
     // SAFETY: sets one integer option, which mimalloc reads at each purge.
     unsafe {
         libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
@@ -367,9 +371,32 @@ pub fn allocator_commit() -> (usize, usize) {
 /// native libraries still use: glibc keeps freed pages in the arena of the
 /// thread that allocated them, and macOS in its zones until memory runs short.
 pub fn release_free_memory() {
+    // On iOS every idle worker, the idle pool and the memory watcher call this, and
+    // `mi_collect(true)` plus `malloc_zone_pressure_relief` walk every heap and zone and
+    // contend with the render thread's allocations. Do it at most once every 30 s there.
+    #[cfg(target_os = "ios")]
+    {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        static START: OnceLock<Instant> = OnceLock::new();
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        const EVERY: Duration = Duration::from_secs(30);
+        let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < EVERY.as_millis() as u64 {
+            return;
+        }
+        if LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+    }
     // SAFETY: frees only pages no allocation uses (this thread's heap, shared arenas).
     unsafe {
-        libmimalloc_sys::mi_collect(true);
+        libmimalloc_sys::mi_collect(cfg!(not(target_os = "ios")));
     }
     release();
 }
@@ -820,4 +847,3 @@ fn available_memory() -> Option<usize> {
 fn available_memory() -> Option<usize> {
     None
 }
-
