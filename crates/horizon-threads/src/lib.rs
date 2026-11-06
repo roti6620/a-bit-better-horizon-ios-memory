@@ -46,6 +46,8 @@ fn parse_worker_count(value: Option<String>) -> Option<usize> {
 /// unprivileged thread lower its priority but not raise it (and the JVM
 /// leaves it there too). Whether the OS took it.
 pub fn favour_current() -> bool {
+    #[cfg(target_os = "ios")]
+    thermal::watch();
     if std::thread::available_parallelism().map_or(1, |n| n.get()) <= 4 {
         return false;
     }
@@ -326,6 +328,8 @@ const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 /// quarter more memory than with the system heap; without it a few percent,
 /// and generation keeps most of its speed-up.
 pub fn configure_allocator() {
+    #[cfg(target_os = "ios")]
+    thermal::watch();
     // iOS keeps mimalloc's own purge delay: with 0, every page a mesh or chunk job
     // frees goes back to the kernel at once (madvise), and the next job faults it in
     // again on the thread that is running the frame, which shows as random stutter.
@@ -522,6 +526,98 @@ pub fn keep_stdio_from_children() {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
             }
         }
+    }
+}
+
+/// A diagnostic for iOS: writes `Documents/horizon-thermal.log` (Files > On My iPhone > Horizon) with the
+/// device's thermal state and Low Power Mode, once at start, on every change, and every 30 s. Thermal state is
+/// `NSProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical; from "fair" on, iOS lowers the
+/// CPU and GPU clocks by itself. Compare its timestamps with when the frame rate drops.
+#[cfg(target_os = "ios")]
+mod thermal {
+    use std::ffi::{c_char, c_long, c_void};
+    use std::io::Write;
+    use std::sync::Once;
+    use std::time::{Duration, Instant};
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type Send0Ptr = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type Send0Long = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_long;
+    type Send0Bool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_char;
+
+    /// `[[NSProcessInfo processInfo] thermalState]` and `isLowPowerModeEnabled`; `None` if Foundation is
+    /// not there.
+    fn read() -> Option<(u8, bool)> {
+        // SAFETY: plain Objective-C getters on the shared NSProcessInfo, safe from any thread; objc_msgSend
+        // is called through the function type its arm64 ABI uses for each return type.
+        unsafe {
+            let class = objc_getClass(c"NSProcessInfo".as_ptr());
+            if class.is_null() {
+                return None;
+            }
+            let raw: unsafe extern "C" fn() = objc_msgSend;
+            let to_ptr: Send0Ptr = std::mem::transmute(raw);
+            let to_long: Send0Long = std::mem::transmute(raw);
+            let to_bool: Send0Bool = std::mem::transmute(raw);
+            let info = to_ptr(class, sel_registerName(c"processInfo".as_ptr()));
+            if info.is_null() {
+                return None;
+            }
+            let state = to_long(info, sel_registerName(c"thermalState".as_ptr()));
+            let low = to_bool(info, sel_registerName(c"isLowPowerModeEnabled".as_ptr()));
+            Some((state.clamp(0, 3) as u8, low != 0))
+        }
+    }
+
+    pub fn watch() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("Thermal log".into())
+                .spawn(|| {
+                    let Some(home) = std::env::var_os("HOME") else {
+                        return;
+                    };
+                    let path = std::path::Path::new(&home)
+                        .join("Documents")
+                        .join("horizon-thermal.log");
+                    let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    else {
+                        return;
+                    };
+                    let start = Instant::now();
+                    let mut last = None;
+                    let mut last_line = Instant::now();
+                    let _ = writeln!(file, "--- start ---");
+                    loop {
+                        if let Some(now) = read() {
+                            if last != Some(now) || last_line.elapsed() >= Duration::from_secs(30) {
+                                let _ = writeln!(
+                                    file,
+                                    "t={}s thermal={} lowpower={}",
+                                    start.elapsed().as_secs(),
+                                    now.0,
+                                    u8::from(now.1)
+                                );
+                                let _ = file.flush();
+                                last = Some(now);
+                                last_line = Instant::now();
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                });
+            let _ = spawned;
+        });
     }
 }
 
