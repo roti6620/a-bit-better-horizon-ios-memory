@@ -16,17 +16,20 @@ concurrency:
 env:
   HORIZON_TELEMETRY_URL: "off"
   IOS_TARGET: aarch64-apple-ios
+  # `--release` with the `fast` profile's codegen: the release profile's single codegen unit and LTO cost minutes
+  # and the unsigned bundle is a test build.
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_INCREMENTAL: "0"
+  # The app's own minimum (project.yml); rustc and cc read it, and the Xcode step's Cargo phase sees the same.
   IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-  CARGO_PROFILE_RELEASE_LTO: "true"
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
 
 jobs:
   ipa:
     # The native launcher uses the iOS 26 SDK (Liquid Glass). macos-15 defaults to Xcode 16.4.
     # MAC_RUNNER remains available for a maintainer-provided runner with Xcode 26 or newer.
     runs-on: ${{ github.event_name == 'pull_request' && 'macos-26' || vars.MAC_RUNNER || 'macos-26' }}
-    timeout-minutes: 180
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -34,56 +37,55 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      
       - name: Check the Apple toolchain
         run: bash tools/ci/ios-toolchain.sh
-      
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.IOS_TARGET }}
-      
       - uses: Swatinem/rust-cache@v2
         if: runner.environment == 'github-hosted'
         with:
           shared-key: ios-${{ env.IOS_TARGET }}
-      
       - name: Build the game
+        # The Microsoft sign-in app (msa.rs): a repository variable overrides the built-in one; unset, it stays.
         env:
           HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
-        run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-client --bin horizon-client --no-default-features --features audio
-
+        # The defaults minus `controllers` (GameController reads pads), with `audio`: project.yml's Cargo phase
+        # uses the same flags, so HORIZON_GAME_PREBUILT below finds this build.
+        run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-client --no-default-features --features audio
       - name: Bundle it
         env:
           HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
         run: |
           set -euo pipefail
-          app=Payload/HorizonGame.app
-          mkdir -p "$app"
-          
-          cp target/$IOS_TARGET/release/horizon-client "$app/"
-          
-          sed "s/@BUILD@/${{ github.run_number }}/g" packaging/ios/Info.plist > "$app/Info.plist"
+          command -v xcodegen >/dev/null || brew install xcodegen
+          ( cd packaging/ios && xcodegen generate )
+          HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonIOS.xcodeproj \
+            -target HorizonGame -configuration Release -sdk iphoneos -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
+            build > xcode-game-build.log 2>&1 || { tail -60 xcode-game-build.log; exit 1; }
           python3 - <<'PYCONFIG'
           import os, plistlib
-          path = 'Payload/HorizonGame.app/Info.plist'
+          path = 'build-ios/HorizonGame.app/Info.plist'
           with open(path, 'rb') as file:
               info = plistlib.load(file)
           info['HorizonMSAClientID'] = os.environ.get('HORIZON_MSA_CLIENT_ID', '')
           with open(path, 'wb') as file:
               plistlib.dump(info, file)
           PYCONFIG
-          
-          plutil -lint "$app/Info.plist"
-          printf 'APPL????' > "$app/PkgInfo"
-          icon=docs/media/brand/icon-1024.png
-          for spec in 60x60@2x:120 60x60@3x:180 76x76@2x:152 83.5x83.5@2x:167; do
-            sips -z "${spec#*:}" "${spec#*:}" "$icon" --out "$app/AppIcon${spec%:*}.png" >/dev/null
-          done
-          
-          codesign --force --sign - "$app"
-          zip -qry Horizon-game-unsigned.ipa Payload
-          ls -l Horizon-game-unsigned.ipa
-
+          rm -rf game-xcode && mkdir -p game-xcode/Payload
+          cp -a build-ios/HorizonGame.app game-xcode/Payload/
+          ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )
+      - name: Preserve the Xcode failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcode-failure-log
+          path: xcode-game-build.log
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Check the distributable contains no prepared assets
         run: |
           python3 - <<'PYASSETS'
@@ -92,14 +94,12 @@ jobs:
               if any('horizon-resources.json' in name for name in ipa.namelist()):
                   raise SystemExit('::error::the .ipa carries prepared vanilla assets; refusing to publish it')
           PYASSETS
-
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-ios-game
           path: Horizon-game-unsigned.ipa
           retention-days: 7
           if-no-files-found: error
-
       - name: Send the .ipa to Discord
         # Delivery is optional: the IPA is already available in the run's artifacts.
         continue-on-error: true
@@ -128,3 +128,4 @@ jobs:
               echo "::warning::Discord delivery failed (HTTP $code). The IPA is available in this run's artifacts."
               ;;
           esac
+          
