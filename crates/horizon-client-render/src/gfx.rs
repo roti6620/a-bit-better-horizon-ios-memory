@@ -87,6 +87,13 @@ pub fn outline_vertices(edges: &[[f64; 6]], camera: glam::DVec3) -> Vec<[f32; 6]
 /// the sections it removes. Keep the pass available for explicit A/B checks,
 /// while leaving hardware adapters on the existing default.
 fn occlusion_culling_requested(info: &wgpu::AdapterInfo, env: Option<&str>) -> bool {
+    // iOS: off unless `HORIZON_GPU_CULL` asks for it. Each pass the test adds makes an Apple GPU store
+    // and reload the whole frame (see `cull::TILED_MIN_SECTIONS`, measured on an M4 Pro), a fixed cost
+    // that a phone's GPU may not earn back at render distance 12 (A/B test for the 40 fps lock).
+    #[cfg(target_os = "ios")]
+    if env.is_none() {
+        return false;
+    }
     env != Some("0") && (env.is_some() || info.device_type != wgpu::DeviceType::Cpu)
 }
 
