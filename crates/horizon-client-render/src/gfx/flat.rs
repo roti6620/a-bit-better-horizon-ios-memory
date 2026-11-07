@@ -173,8 +173,17 @@ pub fn wanted(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
 /// emulates multi-draw (Metal, past `MIN_SECTIONS`), on Intel Gen11/Gen12's Vulkan
 /// driver, or with `HORIZON_FLAT_DRAWS=1`. Elsewhere per-section draws stay.
 pub fn for_vanilla(info: &wgpu::AdapterInfo) -> bool {
+    // iOS: frames without a shader pack never draw flat (`HORIZON_FLAT_DRAWS=1` still forces it). The
+    // bar `MIN_SECTIONS` was measured on an M4 Pro; on a phone, a view near it flips between the flat
+    // path (a compute pass and an index list) and per-section draws from one frame to the next, and
+    // the frame time with it, which shows as 60 <-> 40 fps while walking. A shader pack's terrain and
+    // shadow pass still draw flat (`min_sections` is `usize::MAX`, not 0).
+    #[cfg(target_os = "ios")]
+    let metal = false;
+    #[cfg(not(target_os = "ios"))]
+    let metal = info.backend == wgpu::Backend::Metal;
     std::env::var("HORIZON_FLAT_DRAWS").as_deref() == Ok("1")
-        || info.backend == wgpu::Backend::Metal
+        || metal
         || is_broken_intel_vulkan(info)
 }
 
